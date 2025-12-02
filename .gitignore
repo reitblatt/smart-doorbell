@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+
+# C/C++
+*.o
+*.a
+*.so
+build/
+cmake-build-*/
+
+# IDE
+.vscode/settings.json
+.vscode/launch.json
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific
+*.log
+config/credentials.json
