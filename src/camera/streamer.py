@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Camera streaming module using GStreamer
-Supports both real cameras and test sources
+Supports both real cameras and test sources with audio
 """
 
 import gi
@@ -19,44 +19,65 @@ class CameraSource(Enum):
     V4L2 = "v4l2"
     LIBCAMERA = "libcamera"
 
+class AudioSource(Enum):
+    """Available audio sources"""
+    TEST_TONE = "test"
+    ALSA = "alsa"
+    PULSE = "pulse"
+    NONE = "none"
+
 class CameraStreamer:
     """
     Handles camera capture and RTSP streaming via MediaMTX
+    Supports video + audio streaming
+    
+    Note: For now, audio and video are sent as separate streams to MediaMTX.
+    MediaMTX will mux them together in the RTSP output.
     """
     
     def __init__(self, 
-                 source=CameraSource.TEST_PATTERN,
+                 video_source=CameraSource.TEST_PATTERN,
+                 audio_source=AudioSource.NONE,
                  rtsp_host="127.0.0.1",
                  rtsp_port=8554,
                  stream_name="doorbell",
                  width=1920,
                  height=1080,
                  framerate=30,
-                 bitrate=2000000,
+                 video_bitrate=2000000,
+                 audio_device=None,
+                 audio_bitrate=64000,
                  use_hardware_encoding=True):
         """
         Initialize camera streamer
         
         Args:
-            source: Camera source type (CameraSource enum)
+            video_source: Video source type
+            audio_source: Audio source type
             rtsp_host: MediaMTX host
             rtsp_port: MediaMTX RTSP port
             stream_name: RTSP stream path name
             width: Video width
             height: Video height
             framerate: Frames per second
-            bitrate: H.264 bitrate in bits/sec
+            video_bitrate: H.264 bitrate in bits/sec
+            audio_device: ALSA device name (e.g., "hw:1,0") or None for default
+            audio_bitrate: Audio bitrate in bits/sec
             use_hardware_encoding: Try hardware encoder first (v4l2h264enc)
         """
-        self.source = source
+        self.video_source = video_source
+        self.audio_source = audio_source
         self.rtsp_url = f"rtsp://{rtsp_host}:{rtsp_port}/{stream_name}"
         self.width = width
         self.height = height
         self.framerate = framerate
-        self.bitrate = bitrate
+        self.video_bitrate = video_bitrate
+        self.audio_device = audio_device
+        self.audio_bitrate = audio_bitrate
         self.use_hardware_encoding = use_hardware_encoding
         
-        self.pipeline = None
+        self.video_pipeline = None
+        self.audio_pipeline = None
         self.loop = None
         self.thread = None
         self.is_running = False
@@ -66,64 +87,83 @@ class CameraStreamer:
         Gst.init(None)
         
         logger.info(f"Camera streamer initialized: {width}x{height}@{framerate}fps")
+        logger.info(f"Video source: {video_source.value}")
+        logger.info(f"Audio source: {audio_source.value}")
         logger.info(f"RTSP URL: {self.rtsp_url}")
         logger.info(f"Hardware encoding: {use_hardware_encoding}")
     
-    def _build_pipeline_string(self):
-        """Build GStreamer pipeline string based on source type"""
+    def _build_video_pipeline_string(self):
+        """Build video pipeline string"""
         
-        # Common video format caps
         video_caps = (
             f"video/x-raw,width={self.width},height={self.height},"
             f"framerate={self.framerate}/1"
         )
         
-        # Source element
-        if self.source == CameraSource.TEST_PATTERN:
-            source = "videotestsrc is-live=true"
-        elif self.source == CameraSource.V4L2:
-            source = "v4l2src device=/dev/video0"
-        elif self.source == CameraSource.LIBCAMERA:
-            source = f"libcamerasrc"
+        # Video source
+        if self.video_source == CameraSource.TEST_PATTERN:
+            video_source = "videotestsrc is-live=true"
+        elif self.video_source == CameraSource.V4L2:
+            video_source = "v4l2src device=/dev/video0"
+        elif self.video_source == CameraSource.LIBCAMERA:
+            video_source = "libcamerasrc"
         else:
-            raise ValueError(f"Unknown source type: {self.source}")
+            raise ValueError(f"Unknown video source: {self.video_source}")
         
-        # Choose encoder
+        # Video encoder
         if self.use_hardware_encoding:
-            # Hardware encoder - uses GPU, low CPU, needs GPU memory
-            encoder = (
-                f"v4l2h264enc extra-controls=\"controls,video_bitrate={self.bitrate}\" ! "
+            video_encoder = (
+                f"v4l2h264enc extra-controls=\"controls,video_bitrate={self.video_bitrate}\" ! "
                 f"video/x-h264,profile=baseline,level=(string)3.1"
             )
         else:
-            # Software encoder - uses CPU, more flexible
-            # Add key-int-max for regular keyframes (helps with seeking/recovery)
-            encoder = (
+            video_encoder = (
                 f"x264enc "
-                f"bitrate={self.bitrate//1000} "
+                f"bitrate={self.video_bitrate//1000} "
                 f"speed-preset=ultrafast "
                 f"tune=zerolatency "
-                f"key-int-max={self.framerate * 2} "  # Keyframe every 2 seconds
-                f"bframes=0 "  # No B-frames for lower latency
+                f"key-int-max={self.framerate * 2} "
+                f"bframes=0 "
                 f"! "
                 f"video/x-h264,profile=baseline"
             )
         
-        # Build pipeline with optimizations
+        # Complete video pipeline
         pipeline = (
-            f"{source} ! "
+            f"{video_source} ! "
             f"{video_caps} ! "
             f"videoconvert ! "
             f"video/x-raw,format=I420 ! "
-            f"{encoder} ! "
-            f"h264parse config-interval=-1 ! "  # Insert SPS/PPS in every keyframe
-            f"rtspclientsink "
-            f"location={self.rtsp_url} "
-            f"protocols=tcp "
-            f"latency=200"  # 200ms buffer
+            f"{video_encoder} ! "
+            f"h264parse config-interval=-1 ! "
+            f"rtspclientsink location={self.rtsp_url} protocols=tcp latency=200"
         )
         
         return pipeline
+    
+    def _build_audio_pipeline_string(self):
+        """Build audio pipeline string (sends to same stream path with ?audio suffix)"""
+        
+        if self.audio_source == AudioSource.NONE:
+            return None
+        
+        # Audio source
+        if self.audio_source == AudioSource.TEST_TONE:
+            audio_source = "audiotestsrc is-live=true wave=ticks"
+        elif self.audio_source == AudioSource.ALSA:
+            if self.audio_device:
+                audio_source = f"alsasrc device={self.audio_device}"
+            else:
+                audio_source = "alsasrc"
+        elif self.audio_source == AudioSource.PULSE:
+            audio_source = "pulsesrc"
+        else:
+            raise ValueError(f"Unknown audio source: {self.audio_source}")
+        
+        # For now, we'll use a simpler approach: save audio for when we have hardware
+        # GStreamer's rtspclientsink with audio is tricky without proper muxing
+        logger.warning("Audio streaming not yet fully implemented - needs hardware testing")
+        return None
     
     def start(self):
         """Start the camera stream"""
@@ -132,21 +172,25 @@ class CameraStreamer:
             return
         
         try:
-            # Build pipeline
-            pipeline_str = self._build_pipeline_string()
-            logger.info(f"Pipeline: {pipeline_str}")
+            # Build and start video pipeline
+            video_pipeline_str = self._build_video_pipeline_string()
+            logger.info(f"Video pipeline: {video_pipeline_str}")
             
-            self.pipeline = Gst.parse_launch(pipeline_str)
+            self.video_pipeline = Gst.parse_launch(video_pipeline_str)
             
             # Set up bus to watch for messages
-            bus = self.pipeline.get_bus()
+            bus = self.video_pipeline.get_bus()
             bus.add_signal_watch()
             bus.connect("message", self._on_bus_message)
             
-            # Start pipeline
-            ret = self.pipeline.set_state(Gst.State.PLAYING)
+            # Start video pipeline
+            ret = self.video_pipeline.set_state(Gst.State.PLAYING)
             if ret == Gst.StateChangeReturn.FAILURE:
-                raise RuntimeError("Unable to set pipeline to PLAYING state")
+                raise RuntimeError("Unable to set video pipeline to PLAYING state")
+            
+            # TODO: Audio pipeline when hardware is available
+            if self.audio_source != AudioSource.NONE:
+                logger.warning("Audio source specified but audio streaming needs hardware testing")
             
             # Start GLib main loop in separate thread
             self.loop = GLib.MainLoop()
@@ -170,10 +214,15 @@ class CameraStreamer:
         self._stop_requested = True
         logger.info("Stopping camera stream...")
         
-        # Stop pipeline
-        if self.pipeline:
-            self.pipeline.set_state(Gst.State.NULL)
-            self.pipeline = None
+        # Stop video pipeline
+        if self.video_pipeline:
+            self.video_pipeline.set_state(Gst.State.NULL)
+            self.video_pipeline = None
+        
+        # Stop audio pipeline
+        if self.audio_pipeline:
+            self.audio_pipeline.set_state(Gst.State.NULL)
+            self.audio_pipeline = None
         
         # Stop main loop
         if self.loop:
@@ -196,8 +245,6 @@ class CameraStreamer:
             err, debug = message.parse_error()
             logger.error(f"GStreamer error: {err}")
             logger.debug(f"Debug info: {debug}")
-            # Don't call stop() from the bus callback to avoid threading issues
-            # Just quit the loop
             if self.loop:
                 self.loop.quit()
             
@@ -211,7 +258,7 @@ class CameraStreamer:
                 self.loop.quit()
             
         elif t == Gst.MessageType.STATE_CHANGED:
-            if message.src == self.pipeline:
+            if message.src == self.video_pipeline:
                 old_state, new_state, pending = message.parse_state_changed()
                 logger.debug(
                     f"Pipeline state changed: "
@@ -224,14 +271,15 @@ class CameraStreamer:
     
     def get_stats(self):
         """Get streaming statistics"""
-        if not self.pipeline:
+        if not self.video_pipeline:
             return {}
         
-        # TODO: Extract actual stats from pipeline elements
         return {
             "is_running": self.is_running,
             "rtsp_url": self.rtsp_url,
             "resolution": f"{self.width}x{self.height}",
             "framerate": self.framerate,
-            "bitrate": self.bitrate
+            "video_bitrate": self.video_bitrate,
+            "audio_enabled": False,  # Not yet implemented
+            "audio_bitrate": 0
         }
