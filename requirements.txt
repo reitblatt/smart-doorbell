@@ -1,0 +1,4 @@
+# Add Python dependencies as you discover them
+# For now, just placeholders:
+gst-python
+pyalsaaudio
