@@ -1,0 +1,37 @@
+# Smart Video Doorbell Configuration
+
+video:
+  source: test  # test, v4l2, libcamera
+  width: 1920
+  height: 1080
+  framerate: 30
+  bitrate: 2000000  # 2 Mbps
+  hardware_encoding: false  # Set to true when GPU memory increased
+
+audio:
+  enabled: false  # Enable when USB audio device connected
+  source: none    # none, test, alsa, pulse
+  device: null    # e.g., "hw:1,0" - check with arecord -l
+  bitrate: 64000  # 64 Kbps
+
+rtsp:
+  host: 0.0.0.0   # Listen on all interfaces
+  port: 8554
+  stream_name: doorbell
+
+button:
+  enabled: false  # Enable when button GPIO connected
+  gpio_pin: 17
+  debounce_ms: 200
+
+matter:
+  enabled: false  # Enable when Matter integration ready
+  vendor_id: 0xFFF1
+  product_id: 0x8001
+
+substream:
+  enabled: false  # Enable for Frigate motion detection
+  width: 640
+  height: 480
+  framerate: 10
+  bitrate: 500000  # 500 Kbps
